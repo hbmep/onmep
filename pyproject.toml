@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onmep"
+version = "0.5.0"
+description = "Online acquisition of neural recruitment curves"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Vishweshwar Tyagi", email = "vt2353@columbia.edu" },
+    { name = "James R. McIntosh", email = "jrm2263@cumc.columbia.edu" },
+    { name = "Daniel Twili", email = "dt2589@columbia.edu" },
+]
+dependencies = [
+    "hbmep>=0.8.0",
+    "numpy>=1.24.2,<2.0",
+    "jax>=0.4.24",
+    "numpyro>=0.13.2",
+    "pandas>=2.0.2",
+    "scikit-learn>=1.2.1",
+    "arviz>=0.18.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.2",
+    "joblib>=1.3.2",
+    "pylsl>=1.18.1",
+    "xmltodict>=1.0.2",
+    "pydantic>=2.13.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "notebook>=7.3.2",
+    # Testing
+    "pytest>=7.4.0",
+    "pytest-pycodestyle>=2.3.1",
+    "pytest-cov>=4.1.0",
+    # Docs
+    "Sphinx==7.3.7",
+    "sphinx-autobuild==2024.04.16",
+    "sphinx-book-theme==1.1.3",
+    "sphinxcontrib.bibtex==2.6.2",
+    "sphinx-copybutton==0.5.2",
+    "myst_nb==1.1.0"
+]
+cuda12 = ["jax[cuda12]>=0.4.24"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-v --color=yes --junit-xml=out/junit/junit.xml --pycodestyle src --cov --cov-report term-missing --doctest-modules"
+junit_family = "xunit2"
+testpaths = ["tests"]
+
+[project.urls]
+"Homepage" = "https://github.com/hbmep/onmep"
+"Bug Tracker" = "https://github.com/hbmep/onmep/issues"
