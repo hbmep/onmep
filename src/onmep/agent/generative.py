@@ -1,120 +1,237 @@
-from functools import partial
-
 import hbmep as mep
-from jax import random, numpy as jnp
-from jax.scipy.special import gammaln
+from jax import numpy as jnp
+import numpyro as pyro
+import numpyro.distributions as dist
 
-EPS = 1e-3
-LOG2PI = jnp.log(2.0 * jnp.pi)
+from onmep.agent.likelihood import EPS
 
 
-class LikelihoodMixin:
-    @property
-    def _model(self):
-        return self._model_fn
+class GenerativeMixin:
+    @staticmethod
+    def _sample_priors(
+        *,
+        num_features,
+        num_response,
+        include_c2: bool = True,
+        truncate_g: bool = False,
+        **kw
+    ):
+        fn_params, lik_params = {}, {}
+        with pyro.plate(mep.site.num_response, num_response):
+            with pyro.plate(mep.site.num_features[0], num_features[0]):
+                fn_params[mep.site.a] = pyro.sample(
+                    mep.site.a, dist.TruncatedNormal(50., 50., low=0.)
+                )
+                fn_params[mep.site.b] = pyro.sample(mep.site.b, dist.HalfNormal(1.))
 
-    @_model.setter
-    def _model(self, fn):
-        self._model_fn = fn
-        name = fn.__name__
+                if truncate_g:
+                    fn_params[mep.site.g] = pyro.sample(
+                        mep.site.g,
+                        dist.TruncatedNormal(0., 0.1, low=0., high=0.045)
+                    )
+                else:
+                    fn_params[mep.site.g] = pyro.sample(mep.site.g, dist.HalfNormal(.1))
 
-        rl = (
-            partial(mep.functional.rectified_logistic, eps=EPS),
-            [mep.site.a, mep.site.b, mep.site.g, mep.site.h, mep.site.v],
-        )
+                fn_params[mep.site.h] = pyro.sample(mep.site.h, dist.HalfNormal(5.))
+                fn_params[mep.site.v] = pyro.sample(mep.site.v, dist.HalfNormal(5.))
 
-        gamma = (
-            self._gamma_params_all,
-            self._gamma_sample_y,
-            self._gamma_loglik,
-        )
-        lognormal = (
-            self._lognormal_params_all,
-            self._lognormal_sample_y,
-            self._lognormal_loglik,
-        )
+                lik_params[mep.site.c1] = pyro.sample(mep.site.c1, dist.HalfNormal(5.))
+                if include_c2:
+                    lik_params[mep.site.c2] = pyro.sample(mep.site.c2, dist.HalfNormal(.5))
 
-        if name in {"rl_gamma", "rl_rmt_gamma"}:
-            self._fn, self._fn_args = rl
-            self._params_all, self._sample_y, self._loglik = gamma
-
-        elif name == "rl_lognormal":
-            self._fn, self._fn_args = rl
-            self._params_all, self._sample_y, self._loglik = lognormal
-
-        elif name == "rl_delta_gamma":
-            self._fn, self._fn_args = rl
-            self._params_all, self._sample_y, self._loglik = gamma
-
-        else:
-            raise ValueError(f"Unknown model function assigned to _model: {name}")
-
-    def _gamma_params_all(self, x: float, k: int, posterior: dict):
-        mu = self._fn(x, *(posterior[u][:, k, :] for u in self._fn_args))  # (S, R)
-        alpha, beta = mep.BaseModel.gamma_likelihood(
-            mu,
-            posterior[mep.site.c1][:, k, :],
-            posterior[mep.site.c2][:, k, :]
-        )   # (S, R)
-        return alpha, beta
+        return fn_params, lik_params
 
     @staticmethod
-    def _gamma_sample_y(key, *params):
-        """
-        Uses:
-            z ~ Gamma(site.alpha, 1) (in shape-rate parameterization)
-            z / site.beta ~ Gamma(site.alpha, site.beta)
-        """
-        alpha, beta = params
-        return random.gamma(key, a=alpha) / beta
+    def _observe(
+        *,
+        intensity,
+        features,
+        response,
+        num_response,
+        num_used,
+        use_mixture,
+        mu,
+        lik,
+        lik_params,
+        **kw
+    ):
+        num_data = intensity.shape[0]
 
-    @staticmethod
-    def _gamma_loglik(y, *params):
-        """
-        Joint Gamma(site.alpha, site.beta) log-likelihood across
-        R muscles (conditionally independent). Inputs broadcast to
-        (..., R) -> (...).
-        """
-        alpha, beta = params
-        return jnp.sum(
-            alpha * jnp.log(beta)
-            - gammaln(alpha)
-            + (alpha - 1.0) * jnp.log(y)
-            - beta * y,
-            axis=-1,
+        mask_obs = True
+        if num_used is not None:
+            mask_obs = (jnp.arange(num_data) < num_used)[:, None]
+        if response is not None:
+            mask_obs = mask_obs & jnp.invert(jnp.isnan(response))
+
+        if use_mixture:
+            if response is None:
+                q = 0.
+            else:
+                q = pyro.sample(mep.site.outlier_prob, dist.Uniform(0., 0.01))
+
+        with pyro.handlers.mask(mask=mask_obs):
+            with pyro.plate(mep.site.num_response, num_response):
+                with pyro.plate(mep.site.num_data, num_data):
+                    pyro.deterministic(mep.site.mu, mu)
+                    if lik == "gamma":
+                        alpha, beta = mep.BaseModel.gamma_likelihood(
+                            mu,
+                            lik_params[mep.site.c1][*features.T],
+                            lik_params[mep.site.c2][*features.T]
+                        )
+                        fg = dist.Gamma(concentration=alpha, rate=beta)
+                    elif lik == "lognormal":
+                        loc = jnp.log(mu)
+                        scale = lik_params[mep.site.c1][*features.T]
+                        fg = dist.LogNormal(loc=loc, scale=scale)
+                    else:
+                        raise ValueError
+
+                    if use_mixture:
+                        mixing_distribution = dist.Categorical(
+                            probs=jnp.stack([1 - q, q], axis=-1)
+                        )
+                        component_distributions = [
+                            fg, dist.HalfNormal(scale=10.)
+                        ]
+                        dist_ = dist.MixtureGeneral(
+                            mixing_distribution=mixing_distribution,
+                            component_distributions=component_distributions,
+                        )
+                    else:
+                        dist_ = fg
+
+                    pyro.sample(mep.site.obs, dist_, obs=response)
+
+    def rl_gamma(self, intensity, features, response=None, num_used=None, **kw):
+        include_c2 = True
+        lik = "gamma"
+        fn_params, lik_params = self._sample_priors(include_c2=include_c2, **kw)
+
+        mu = mep.functional.rectified_logistic(
+            intensity,
+            **{u: v[*features.T] for u, v in fn_params.items()},
+            eps=EPS
         )
 
-    def _lognormal_params_all(self, x: float, k: int, posterior: dict):
-        mu = self._fn(x, *(posterior[u][:, k, :] for u in self._fn_args))  # (S, R)
-        loc = jnp.log(mu)                           # (S, R)
-        scale = posterior[mep.site.c1][:, k, :]     # (S, R)
-        return loc, scale
+        self._observe(
+            intensity=intensity,
+            features=features,
+            response=response,
+            num_used=num_used,
+            mu=mu,
+            lik=lik,
+            lik_params=lik_params,
+            **kw
+        )
+
+    def rl_lognormal(self, intensity, features, response=None, num_used=None, **kw):
+        include_c2 = False
+        lik = "lognormal"
+        fn_params, lik_params = self._sample_priors(include_c2=include_c2, **kw)
+
+        mu = mep.functional.rectified_logistic(
+            intensity,
+            **{u: v[*features.T] for u, v in fn_params.items()},
+            eps=EPS
+        )
+
+        self._observe(
+            intensity=intensity,
+            features=features,
+            response=response,
+            num_used=num_used,
+            mu=mu,
+            lik=lik,
+            lik_params=lik_params,
+            **kw
+        )
+
+    def rl_rmt_gamma(self, intensity, features, response=None, num_used=None, **kw):
+        include_c2 = True
+        lik = "gamma"
+        fn_params, lik_params = self._sample_priors(include_c2=include_c2, truncate_g=True, **kw)
+
+        mu = mep.functional.rectified_logistic(
+            intensity,
+            **{u: v[*features.T] for u, v in fn_params.items()},
+            eps=EPS
+        )
+
+        self._observe(
+            intensity=intensity,
+            features=features,
+            response=response,
+            num_used=num_used,
+            mu=mu,
+            lik=lik,
+            lik_params=lik_params,
+            **kw
+        )
 
     @staticmethod
-    def _lognormal_sample_y(key, *params):
-        """
-        Uses:
-            eps ~ Normal(0, 1)
-            exp(loc + scale * eps) ~ LogNormal(loc, scale)
-        """
-        loc, scale = params
-        eps = random.normal(key, shape=loc.shape)   # (R,)
-        return jnp.exp(loc + scale * eps)           # (R,)
+    def _sample_delta_priors(
+        *,
+        num_features,
+        num_response,
+        target_parameter,
+        **kw
+    ):
+        num_fixed = 1
+        num_delta = num_features[0] - 1
 
-    @staticmethod
-    def _lognormal_loglik(y, *params):
-        """
-        Joint LogNormal(loc, scale) log-likelihood across
-        R muscles (conditionally independent). Inputs broadcast to
-        (..., R) -> (...).
-        """
-        loc, scale = params
-        ly = jnp.log(y)
-        z = (ly - loc) / scale
-        return jnp.sum(
-            -ly
-            - jnp.log(scale)
-            - 0.5 * LOG2PI
-            - 0.5 * z * z,
-            axis=-1,
+        fn_params, lik_params = {}, {}
+        with pyro.plate(mep.site.num_response, num_response):
+            with pyro.plate("num_fixed", num_fixed):
+                a_fixed = pyro.sample("a_fixed", dist.TruncatedNormal(50., 50., low=0.))
+
+            with pyro.plate("num_delta", num_delta):
+                a_delta = pyro.sample("a_delta", dist.Normal(0., 50.))
+
+            if target_parameter == mep.site.a:
+                ...
+
+            elif target_parameter == "delta":
+                pyro.deterministic("delta", jnp.concatenate([a_fixed, a_delta], axis=0))
+
+            else:
+                raise ValueError(f"Invalid target_parameter {target_parameter}")
+
+            fn_params[mep.site.a] = pyro.deterministic(
+                mep.site.a, jnp.concatenate([a_fixed, a_fixed + a_delta], axis=0)
+            )
+
+            with pyro.plate(mep.site.num_features[0], num_features[0]):
+                fn_params[mep.site.b] = pyro.sample(mep.site.b, dist.HalfNormal(1.))
+                fn_params[mep.site.g] = pyro.sample(mep.site.g, dist.HalfNormal(.1))
+
+                fn_params[mep.site.h] = pyro.sample(mep.site.h, dist.HalfNormal(5.))
+                fn_params[mep.site.v] = pyro.sample(mep.site.v, dist.HalfNormal(5.))
+
+                lik_params[mep.site.c1] = pyro.sample(mep.site.c1, dist.HalfNormal(5.))
+                lik_params[mep.site.c2] = pyro.sample(mep.site.c2, dist.HalfNormal(.5))
+
+        return fn_params, lik_params
+
+    def rl_delta_gamma(self, intensity, features, response=None, num_used=None, **kw):
+        lik = "gamma"
+        fn_params, lik_params = self._sample_delta_priors(
+            target_parameter=self.target_parameter, **kw
+        )
+
+        mu = mep.functional.rectified_logistic(
+            intensity,
+            **{u: v[*features.T] for u, v in fn_params.items()},
+            eps=EPS
+        )
+
+        self._observe(
+            intensity=intensity,
+            features=features,
+            response=response,
+            num_used=num_used,
+            mu=mu,
+            lik=lik,
+            lik_params=lik_params,
+            **kw
         )
