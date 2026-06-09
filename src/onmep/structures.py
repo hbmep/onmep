@@ -334,3 +334,27 @@ class ObsArrays:
             response=self._Y[i],
             id=int(self._O[i]),
         )
+
+    def at_slice(self, s):
+        out = ObsArrays(
+            D=self.D,
+            R=self.R,
+            initial_capacity=max(len(range(*s.indices(self._n))), 1),
+        )
+        X = self.X[s]
+        F = self.F[s]
+        Y = self.Y[s]
+        O = self.O[s]
+
+        n = X.shape[0]
+        out._n = n
+        out._X = out._X.at[:n, :].set(X)
+        out._F = out._F.at[:n, :].set(F)
+        out._Y = out._Y.at[:n, :].set(Y)
+        out._O = out._O.at[:n].set(O)
+        return out
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return self.at_slice(idx)
+        return self.at_index(idx)

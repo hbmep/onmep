@@ -9,7 +9,7 @@ from jax import random, Array, numpy as jnp
 from jax.scipy.special import logsumexp
 from scipy.stats import qmc
 from numpyro.infer import NUTS, MCMC
-from numpyro.infer.util import log_likelihood
+from numpyro.infer.util import log_likelihood, unconstrain_fn, constrain_fn
 
 from onmep import Observation, ObsArrays
 from onmep.agent.generative import GenerativeMixin
@@ -95,11 +95,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         if self.num_features > 1:
             raise NotImplementedError(f"Not implemented for {self.num_features} features.")
 
-        # RNG: key: mep.BaseModel and _key: BaseAgent
+        # RNG: key: mep.BaseModel (for update) and _key: BaseAgent (for proposal)
         self.key, self._key = random.split(self.key)
         self.name: str = "base_agent"
 
-        implemented = ("mcmc", "sequential", "svi")
+        implemented = ("mcmc", "snis", "smc", "svi")
         if infer not in implemented:
             raise NotImplementedError(f"infer must be in {implemented}, got {infer}")
 
@@ -317,13 +317,14 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
     ) -> tuple[dict, jnp.ndarray]:
         self._require_data(data, "No observations in buffer, collect data before run_mcmc().")
         model_kw = self._model_kwargs(data)
+        model_kw = model_kw | kw
 
         if self._mcmc["kernel"] is None:
             self._mcmc["kernel"] = NUTS(self._model, **self.nuts_kw)
         mcmc = MCMC(self._mcmc["kernel"], **self.mcmc_kw)
 
         self.key, sub = random.split(self.key)
-        mcmc.run(sub, **model_kw, extra_fields=extra_fields, init_params=init_params, **kw)
+        mcmc.run(sub, **model_kw, extra_fields=extra_fields, init_params=init_params)
         self._mcmc["state"] = mcmc
 
         posterior = mcmc.get_samples()
@@ -334,17 +335,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         logw = jnp.zeros(S)
         return posterior, logw
 
-    def _update_sequential(self, *, data: ObsArrays, **kw) -> tuple[dict, jnp.ndarray]:
-        if self.posterior is None:
-            return self._update_mcmc(data=data, **kw)
+    def _update_reweight(self, *, data: ObsArrays, **kw) -> tuple[jnp.ndarray, jnp.ndarray]:
+        model_kw = self._model_kwargs(data[-1:])
+        model_kw = model_kw | kw
 
-        model_kw = dict(
-            intensity=data.X[-1:],
-            features=data.F[-1:],
-            response=data.Y[-1:],
-        )
-
-        ll = log_likelihood(self._model, self.posterior, **model_kw, **kw)
+        ll = log_likelihood(self._model, self.posterior, **model_kw)
         u = ll[mep.site.obs]
         loglik = u.sum(tuple(range(1, u.ndim))).reshape(-1)
 
@@ -353,15 +348,97 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
         w = jnp.exp(logw)
         ess = 1.0 / jnp.sum(w * w)
+        return logw, ess
 
+    def _needs_rejuvenation(self, ess):
         S = next(iter(self.posterior.values())).shape[0]
         threshold = (
             self.ess_threshold * S
             if self.ess_threshold <= 1.0
             else self.ess_threshold
         )
-        if ess < threshold:
+        return ess < threshold
+
+    def _update_snis(self, *, data: ObsArrays, **kw) -> tuple[dict, jnp.ndarray]:
+        if self.posterior is None:
             return self._update_mcmc(data=data, **kw)
+
+        logw, ess = self._update_reweight(data=data, **kw)
+        if self._needs_rejuvenation(ess):
+            return self._update_mcmc(data=data, **kw)
+
+        return self.posterior, logw
+
+    @staticmethod
+    def _resample_posterior(
+        key: Array,
+        posterior: dict[str, jnp.ndarray],
+        logw: jnp.ndarray,
+    ) -> dict[str, jnp.ndarray]:
+        logw = logw - logsumexp(logw)
+        w = jnp.exp(logw)
+        S = logw.shape[0]
+        u0 = random.uniform(key, ()) / S
+        positions = u0 + jnp.arange(S) / S
+        cdf = jnp.cumsum(w)
+        cdf = cdf.at[-1].set(1.0)
+        idx = jnp.searchsorted(cdf, positions, side="right")
+        posterior_r = {name: v[idx] for name, v in posterior.items()}
+        return posterior_r
+
+    def _liu_west_rejuvenate(
+        self,
+        *,
+        data: ObsArrays,
+        logw: jnp.ndarray,
+        shrinkage: float = 0.98,
+        **kw,
+    ) -> tuple[dict, jnp.ndarray]:
+        model_kw = self._model_kwargs(data)
+        model_kw = model_kw | kw
+
+        z = unconstrain_fn(
+            self._model,
+            model_args=(),
+            model_kwargs=model_kw,
+            params=self.posterior,
+        )
+
+        self.key, sub = random.split(self.key)
+        z = self._resample_posterior(sub, z, logw)
+
+        innovation_var = 1.0 - shrinkage ** 2
+        out = {}
+
+        self.key, sub = random.split(self.key)
+        keys = random.split(sub, len(z))
+
+        for key, (u, v) in zip(keys, z.items()):
+            mean = jnp.mean(v, axis=0, keepdims=True)
+            var = jnp.var(v, axis=0, keepdims=True)
+
+            loc = shrinkage * v + (1.0 - shrinkage) * mean
+            scale = jnp.sqrt(innovation_var * var + 1e-12)
+
+            out[u] = loc + scale * random.normal(key, v.shape)
+
+        S = next(iter(out.values())).shape[0]
+        logw = jnp.zeros(S)
+        out = constrain_fn(
+            self._model,
+            model_args=(),
+            model_kwargs=model_kw,
+            params=out
+        )
+        return out, logw
+
+    def _update_smc(self, *, data: ObsArrays, **kw) -> tuple[dict, jnp.ndarray]:
+        if self.posterior is None:
+            return self._update_mcmc(data=data, **kw)
+
+        logw, ess = self._update_reweight(data=data, **kw)
+        if self._needs_rejuvenation(ess):
+            return self._liu_west_rejuvenate(data=data, logw=logw, **kw)
 
         return self.posterior, logw
 
@@ -442,10 +519,14 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         match self.infer:
             case "mcmc":
                 posterior_new, logw_new = self._update_mcmc(**update_kw)
-            case "sequential":
+            case "snis":
                 if feature0 is not None or response is not None:
-                    raise ValueError("sequential update does not support sliced updates")
-                posterior_new, logw_new = self._update_sequential(**update_kw)
+                    raise ValueError("snis update does not support sliced updates")
+                posterior_new, logw_new = self._update_snis(**update_kw)
+            case "smc":
+                if feature0 is not None or response is not None:
+                    raise ValueError("smc update does not support sliced updates")
+                posterior_new, logw_new = self._update_smc(**update_kw)
             case _:
                 raise NotImplementedError
 

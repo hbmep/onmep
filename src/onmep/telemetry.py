@@ -11,9 +11,9 @@ def _now_ns() -> int:
 @dataclass
 class StepTimes:
     step: int
+    t_update_ns: int = 0
     t_propose_ns: int = 0
     t_step_ns: int = 0
-    t_update_ns: int = 0
     t_ckpt_ns: int = 0
     t_iter_ns: int = 0
     agent_stop: bool = False
