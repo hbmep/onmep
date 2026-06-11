@@ -1,6 +1,8 @@
 import os
 import logging
+from functools import partial
 from dataclasses import dataclass, replace
+from typing import Any, Callable, TypedDict
 
 import hbmep as mep
 import numpy as np
@@ -42,6 +44,12 @@ class Action:
         return obj
 
 
+class MCMCState(TypedDict):
+    state: MCMC | None
+    kernel: NUTS | None
+    model: Callable[..., Any] | None
+
+
 @dataclass
 class Proposal:
     action: Action
@@ -81,15 +89,15 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         K: int = 1,     # possible values of features[0]
         N0: int = 8,    # num observations at 0
         N1: int = 3,    # num random observations for warmup/kickstart
-        grid_lo: float = 0.,
-        grid_hi: float = 100.,
         grid_n: int = 101,
-        grid_max: float = 100.,     # effective grid maximum
-        update_every: int = 1,      # set to 0 to disable updates (e.g. for uniform)
+        grid_min: float = 0.,
+        grid_max: float = 100.,
+        grid_max_eff: float = 100.,     # effective grid maximum
+        update_every: int = 1,          # set to 0 to disable updates (e.g. for uniform)
         use_acquisition: bool = True,
         share_zero: bool = False,
         share_warm: bool = False,
-    ) -> None:
+    ):
         mep.BaseModel.__init__(self, key=key, toml_path=toml_path, config=config)
 
         if self.num_features > 1:
@@ -119,9 +127,9 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         self.share_warm = share_warm
 
         self.grid_n = grid_n
-        self.grid_x = jnp.linspace(grid_lo, grid_hi, grid_n, dtype=self.data.dtype_x)
+        self.grid_x = jnp.linspace(grid_min, grid_max, grid_n, dtype=self.data.dtype_x)
         self.grid_f = jnp.arange(self.K, dtype=self.data.dtype_f)
-        self.grid_max = grid_max
+        self.grid_max_eff = grid_max_eff
 
         self.update_every = update_every
         self.use_acquisition = use_acquisition
@@ -130,7 +138,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         self._perm_x_i: int = 0
         self._last_proposal: Proposal | None = None
 
-        self._mcmc = {"kernel": None, "state": None}
+        self._mcmc: MCMCState = {
+            "state": None,
+            "kernel": None,
+            "model": None,
+        }
         self.posterior: dict | None = None
         self.logw = None
         return
@@ -192,7 +204,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
                 key=sub,
                 N0=self.N0,
                 grid_x=self.grid_x,
-                grid_max=self.grid_max,
+                grid_max=self.grid_max_eff,
             )
             self._perm_x = perm
             self._perm_x_i = 0
@@ -235,7 +247,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
     ) -> Action:
         vals = self._compute_acquisition(feature0=feature0, response=response)  # (K, N)
 
-        mask_x = self.grid_x <= self.grid_max                   # (N,)
+        mask_x = self.grid_x <= self.grid_max_eff               # (N,)
         masked = jnp.where(mask_x[None, :], vals, -jnp.inf)     # (K, N)
 
         flat = jnp.argmax(masked)
@@ -293,19 +305,24 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         return
 
     @staticmethod
-    def _model_kwargs(data: ObsArrays, only_valid=True):
-        if only_valid:
+    def _model_kwargs(data: ObsArrays, use_capacity=False):
+        if use_capacity:
             return dict(
-                intensity=data.X,
-                features=data.F,
-                response=data.Y,
+                intensity=data._X,
+                features=data._F,
+                response=data._Y,
+                num_used=data.n,
             )
         return dict(
-            intensity=data._X,
-            features=data._F,
-            response=data._Y,
-            num_used=data.n,
+            intensity=data.X,
+            features=data.F,
+            response=data.Y,
         )
+
+    def _get_model_fixed(self, **kw):
+        if self._mcmc["model"] is None:
+            self._mcmc["model"] = partial(self._model, **kw)
+        return self._mcmc["model"]
 
     def _update_mcmc(
         self,
@@ -317,10 +334,10 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
     ) -> tuple[dict, jnp.ndarray]:
         self._require_data(data, "No observations in buffer, collect data before run_mcmc().")
         model_kw = self._model_kwargs(data)
-        model_kw = model_kw | kw
 
         if self._mcmc["kernel"] is None:
-            self._mcmc["kernel"] = NUTS(self._model, **self.nuts_kw)
+            model_fixed = self._get_model_fixed(**kw)
+            self._mcmc["kernel"] = NUTS(model_fixed, **self.nuts_kw)
         mcmc = MCMC(self._mcmc["kernel"], **self.mcmc_kw)
 
         self.key, sub = random.split(self.key)
@@ -337,9 +354,9 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
     def _update_reweight(self, *, data: ObsArrays, **kw) -> tuple[jnp.ndarray, jnp.ndarray]:
         model_kw = self._model_kwargs(data[-1:])
-        model_kw = model_kw | kw
+        model_fixed = self._get_model_fixed(**kw)
 
-        ll = log_likelihood(self._model, self.posterior, **model_kw)
+        ll = log_likelihood(model_fixed, self.posterior, **model_kw)
         u = ll[mep.site.obs]
         loglik = u.sum(tuple(range(1, u.ndim))).reshape(-1)
 
@@ -395,10 +412,10 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         **kw,
     ) -> tuple[dict, jnp.ndarray]:
         model_kw = self._model_kwargs(data)
-        model_kw = model_kw | kw
+        model_fixed = self._get_model_fixed(**kw)
 
         z = unconstrain_fn(
-            self._model,
+            model_fixed,
             model_args=(),
             model_kwargs=model_kw,
             params=self.posterior,
@@ -425,7 +442,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         S = next(iter(out.values())).shape[0]
         logw = jnp.zeros(S)
         out = constrain_fn(
-            self._model,
+            model_fixed,
             model_args=(),
             model_kwargs=model_kw,
             params=out
@@ -599,7 +616,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         return d
 
     def _reset_mcmc(self):
-        self._mcmc = {"kernel": None, "state": None}
+        self._mcmc = {
+            "state": None,
+            "kernel": None,
+            "model": None,
+        }
         return
 
     def __setstate__(self, d):
@@ -634,10 +655,10 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             "share_zero": self.share_zero,
             "share_warm": self.share_warm,
 
-            "grid_lo": np.asarray(self.grid_x).min(),
-            "grid_hi": np.asarray(self.grid_x).max(),
             "grid_n": self.grid_n,
-            "grid_max": self.grid_max,
+            "grid_min": np.asarray(self.grid_x).min(),
+            "grid_max": np.asarray(self.grid_x).max(),
+            "grid_max_eff": self.grid_max_eff,
 
             "update_every": self.update_every,
             "use_acquisition": self.use_acquisition,
@@ -680,12 +701,12 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         self.share_zero = state.get("share_zero", self.share_zero)
         self.share_warm = state.get("share_warm", self.share_warm)
 
-        grid_lo = state.get("grid_lo", 0.)
-        grid_hi = state.get("grid_hi", 100.)
+        grid_min = state.get("grid_min", 0.)
+        grid_max = state.get("grid_max", 100.)
         self.grid_n = state.get("grid_n", self.grid_n)
-        self.grid_x = jnp.linspace(grid_lo, grid_hi, self.grid_n, dtype=self.data.dtype_x)
+        self.grid_x = jnp.linspace(grid_min, grid_max, self.grid_n, dtype=self.data.dtype_x)
         self.grid_f = jnp.arange(self.K, dtype=self.data.dtype_f)
-        self.grid_max = state.get("grid_max", self.grid_max)
+        self.grid_max_eff = state.get("grid_max_eff", self.grid_max_eff)
 
         self.update_every = state.get("update_every", self.update_every)
         self.use_acquisition = state.get("use_acquisition", self.use_acquisition)

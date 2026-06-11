@@ -1,3 +1,5 @@
+from functools import partial
+
 import hbmep as mep
 from jax import numpy as jnp
 import numpyro as pyro
@@ -14,7 +16,6 @@ class GenerativeMixin:
         num_response,
         include_c2: bool = True,
         truncate_g: bool = False,
-        **kw
     ):
         fn_params, lik_params = {}, {}
         with pyro.plate(mep.site.num_response, num_response):
@@ -47,14 +48,16 @@ class GenerativeMixin:
         intensity,
         features,
         response,
-        num_response,
         num_used,
+        num_response,
         use_mixture,
-        mu,
+        fn,
+        fn_params,
         lik,
         lik_params,
-        **kw
     ):
+        mu = fn(x=intensity, **{u: v[*features.T] for u, v in fn_params.items()})
+
         num_data = intensity.shape[0]
 
         mask_obs = True
@@ -103,15 +106,26 @@ class GenerativeMixin:
 
                     pyro.sample(mep.site.obs, dist_, obs=response)
 
-    def rl_gamma(self, intensity, features, response=None, num_used=None, **kw):
+    def gamma(
+        self,
+        intensity,
+        features,
+        response=None,
+        num_used=None,
+        num_features=None,
+        num_response=None,
+        use_mixture=None,
+    ):
         include_c2 = True
+        truncate_g = False
+        fn = partial(mep.functional.rectified_logistic, eps=EPS)
         lik = "gamma"
-        fn_params, lik_params = self._sample_priors(include_c2=include_c2, **kw)
 
-        mu = mep.functional.rectified_logistic(
-            intensity,
-            **{u: v[*features.T] for u, v in fn_params.items()},
-            eps=EPS
+        fn_params, lik_params = self._sample_priors(
+            num_features=num_features,
+            num_response=num_response,
+            include_c2=include_c2,
+            truncate_g=truncate_g,
         )
 
         self._observe(
@@ -119,21 +133,34 @@ class GenerativeMixin:
             features=features,
             response=response,
             num_used=num_used,
-            mu=mu,
+            num_response=num_response,
+            use_mixture=use_mixture,
+            fn=fn,
+            fn_params=fn_params,
             lik=lik,
             lik_params=lik_params,
-            **kw
         )
 
-    def rl_lognormal(self, intensity, features, response=None, num_used=None, **kw):
+    def lognormal(
+        self,
+        intensity,
+        features,
+        response=None,
+        num_used=None,
+        num_features=None,
+        num_response=None,
+        use_mixture=None,
+    ):
         include_c2 = False
+        truncate_g = False
+        fn = partial(mep.functional.rectified_logistic, eps=EPS)
         lik = "lognormal"
-        fn_params, lik_params = self._sample_priors(include_c2=include_c2, **kw)
 
-        mu = mep.functional.rectified_logistic(
-            intensity,
-            **{u: v[*features.T] for u, v in fn_params.items()},
-            eps=EPS
+        fn_params, lik_params = self._sample_priors(
+            num_features=num_features,
+            num_response=num_response,
+            include_c2=include_c2,
+            truncate_g=truncate_g,
         )
 
         self._observe(
@@ -141,21 +168,34 @@ class GenerativeMixin:
             features=features,
             response=response,
             num_used=num_used,
-            mu=mu,
+            num_response=num_response,
+            use_mixture=use_mixture,
+            fn=fn,
+            fn_params=fn_params,
             lik=lik,
             lik_params=lik_params,
-            **kw
         )
 
-    def rl_rmt_gamma(self, intensity, features, response=None, num_used=None, **kw):
+    def rmt_gamma(
+        self,
+        intensity,
+        features,
+        response=None,
+        num_used=None,
+        num_features=None,
+        num_response=None,
+        use_mixture=None,
+    ):
         include_c2 = True
+        truncate_g = True
+        fn = partial(mep.functional.rectified_logistic, eps=EPS)
         lik = "gamma"
-        fn_params, lik_params = self._sample_priors(include_c2=include_c2, truncate_g=True, **kw)
 
-        mu = mep.functional.rectified_logistic(
-            intensity,
-            **{u: v[*features.T] for u, v in fn_params.items()},
-            eps=EPS
+        fn_params, lik_params = self._sample_priors(
+            num_features=num_features,
+            num_response=num_response,
+            include_c2=include_c2,
+            truncate_g=truncate_g,
         )
 
         self._observe(
@@ -163,10 +203,12 @@ class GenerativeMixin:
             features=features,
             response=response,
             num_used=num_used,
-            mu=mu,
+            num_response=num_response,
+            use_mixture=use_mixture,
+            fn=fn,
+            fn_params=fn_params,
             lik=lik,
             lik_params=lik_params,
-            **kw
         )
 
     @staticmethod
@@ -175,7 +217,6 @@ class GenerativeMixin:
         num_features,
         num_response,
         target_parameter,
-        **kw
     ):
         num_fixed = 1
         num_delta = num_features[0] - 1
@@ -213,16 +254,23 @@ class GenerativeMixin:
 
         return fn_params, lik_params
 
-    def rl_delta_gamma(self, intensity, features, response=None, num_used=None, **kw):
+    def delta_gamma(
+        self,
+        intensity,
+        features,
+        response=None,
+        num_used=None,
+        num_features=None,
+        num_response=None,
+        use_mixture=None,
+    ):
+        fn = partial(mep.functional.rectified_logistic, eps=EPS)
         lik = "gamma"
-        fn_params, lik_params = self._sample_delta_priors(
-            target_parameter=self.target_parameter, **kw
-        )
 
-        mu = mep.functional.rectified_logistic(
-            intensity,
-            **{u: v[*features.T] for u, v in fn_params.items()},
-            eps=EPS
+        fn_params, lik_params = self._sample_delta_priors(
+            num_features=num_features,
+            num_response=num_response,
+            target_parameter=self.target_parameter,
         )
 
         self._observe(
@@ -230,8 +278,10 @@ class GenerativeMixin:
             features=features,
             response=response,
             num_used=num_used,
-            mu=mu,
+            num_response=num_response,
+            use_mixture=use_mixture,
+            fn=fn,
+            fn_params=fn_params,
             lik=lik,
             lik_params=lik_params,
-            **kw
         )

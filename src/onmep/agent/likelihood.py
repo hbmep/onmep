@@ -34,15 +34,15 @@ class LikelihoodMixin:
             self._lognormal_loglik,
         )
 
-        if name in {"rl_gamma", "rl_rmt_gamma"}:
+        if name in {"gamma", "rmt_gamma"}:
             self._fn, self._fn_args = rl
             self._params_all, self._sample_y, self._loglik = gamma
 
-        elif name in {"rl_lognormal"}:
+        elif name in {"lognormal"}:
             self._fn, self._fn_args = rl
             self._params_all, self._sample_y, self._loglik = lognormal
 
-        elif name == "rl_delta_gamma":
+        elif name == "delta_gamma":
             self._fn, self._fn_args = rl
             self._params_all, self._sample_y, self._loglik = gamma
 
