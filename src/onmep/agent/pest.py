@@ -105,18 +105,15 @@ def run_pest(
 
         max_ll = jnp.max(ll, axis=0)
         mask = ll >= max_ll[None, :] - eps
-        a_best = jnp.sum(jnp.where(mask, a_grid[:, None], 0.0), axis=0) / jnp.sum(mask, axis=0)
 
-        best_idx = jnp.argmax(ll, axis=0)   # (R,)
-        a_best = a_grid[best_idx]           # (R,)
-
-        max_ll = jnp.max(ll, axis=0)
-        mask = ll >= max_ll[None, :] - eps
         a_best = (
-            jnp.sum(jnp.where(mask, a_grid[:, None], 0.0), axis=0)
+            jnp.sum(
+                jnp.where(mask, a_grid[:, None], 0.),
+                axis=0,
+            )
             / jnp.sum(mask, axis=0)
-        )   # (R,)
-        b_best = jnp.clip(0.07 * a_best, 1e-3, None)    # (R,)
+        )                                                   # (R,)
+        b_best = jnp.clip(0.07 * a_best, 1e-3, None)        # (R,)
 
     elif method == "mle2":
         ll = _compute_ll_mle2(
@@ -155,9 +152,8 @@ class PEST(BaseAgent):
     def __init__(
         self,
         *args,
-        method: str = "mle2",
+        method: str = "mle1",
         mep_threshold: float = 0.05,
-        run_hbmep: bool = False,
         a_grid_n: int = 1001,
         b_grid_n: int = 501,
         **kw,
@@ -174,7 +170,6 @@ class PEST(BaseAgent):
         self.name = "pest"
         self.method = method
         self.mep_threshold = mep_threshold
-        self.run_hbmep = run_hbmep
 
         self.a_grid_n = a_grid_n
         self.b_grid_n = b_grid_n
@@ -191,8 +186,9 @@ class PEST(BaseAgent):
     @grid_max_eff.setter
     def grid_max_eff(self, value):
         self._grid_max = value
-        if hasattr(self, "a_grid_n") and hasattr(self, "b_grid_n"):
+        if hasattr(self, "a_grid_n"):
             self._init_a_grid()
+        return
 
     def _init_a_grid(self):
         grid_min = self.grid_x.min()
@@ -209,12 +205,26 @@ class PEST(BaseAgent):
         self.b_grid = 10 ** log_centers
         return
 
-    def _choose_response(self, response: int | None):
+    def _choose_response(self, response: int | None) -> int:
         if response is not None:
             return response
         if self.num_response == 1:
             return 0
-        raise ValueError("PEST requires response when num_response > 1.")
+        num_postwarm = self.data.n - self._num_start
+        return num_postwarm % self.num_response
+
+    def _update_pest(self, data: ObsArrays):
+        self._require_data(data, "No observations in buffer, collect data before running PEST.")
+        model_kw = self._model_kwargs(data, use_capacity=True)
+        a_best, b_best = run_pest(
+            **model_kw,
+            a_grid=self.a_grid,
+            b_grid=self.b_grid,
+            method=self.method,
+            mep_threshold=self.mep_threshold,
+            eps=EPS,
+        )
+        return a_best, b_best
 
     def _compute_acquisition(
         self,
@@ -222,6 +232,11 @@ class PEST(BaseAgent):
         feature0: int | None = None,
         response: int | None = None,
     ):
+        data_pest = self.data
+        a_best, b_best = self._update_pest(data=data_pest)
+        self._pest[mep.site.a] = a_best
+        self._pest[mep.site.b] = b_best
+
         if self._pest[mep.site.a] is None:
             raise ValueError("No pest available for acquisition.")
 
@@ -234,80 +249,11 @@ class PEST(BaseAgent):
         vals = -jnp.abs(self.grid_x[None, :] - target)
         return vals
 
-    def _update_pest(self, data: ObsArrays):
-        self._require_data(data, "No observations in buffer, collect data before running PEST.")
-        model_kw = self._model_kwargs(data, only_valid=False)
-
-        a_best, b_best = run_pest(
-            **model_kw,
-            a_grid=self.a_grid,
-            b_grid=self.b_grid,
-            method=self.method,
-            mep_threshold=self.mep_threshold,
-            eps=EPS,
-        )
-        return a_best, b_best
-
-    def _update_posterior(
-        self,
-        *,
-        data: ObsArrays | None = None,
-        feature0: int | None = None,
-        response: int | None = None,
-    ):
-        if data is None:
-            data = self.data
-
-        if feature0 not in (None, 0):
-            raise NotImplementedError("PEST currently supports only feature0=0.")
-
-        data_pest = data
-        if response is not None:
-            data_pest = data.at_response(response)
-
-        a_best, b_best = self._update_pest(data=data_pest)
-
-        if response is None:
-            self._pest[mep.site.a] = a_best
-            self._pest[mep.site.b] = b_best
-
-        else:
-            if self._pest[mep.site.a] is None:
-                self._pest[mep.site.a] = jnp.full((self.num_response,), jnp.nan)
-                self._pest[mep.site.b] = jnp.full((self.num_response,), jnp.nan)
-
-            self._pest[mep.site.a] = self._pest[mep.site.a].at[response].set(a_best[0])
-            self._pest[mep.site.b] = self._pest[mep.site.b].at[response].set(b_best[0])
-
-        if self.run_hbmep:
-            return super()._update_posterior(
-                data=data,
-                feature0=feature0,
-                response=response,
-            )
-
-        return
-
-    def _should_update(self) -> bool:
-        if not self._in_postwarm_phase:
-            return False
-
-        n_after_warm = self.data.n - self._num_start
-        should_update = (
-            self.update_every > 0
-            and (
-                self._pest[mep.site.a] is None
-                or n_after_warm % self.update_every == 0
-            )
-        )
-        return should_update
-
     def state_dict(self, include_posterior: bool = True) -> dict:
         d = super().state_dict(include_posterior=include_posterior)
         d["pest"] = {
             "method": self.method,
             "mep_threshold": self.mep_threshold,
-            "run_hbmep": self.run_hbmep,
             "a_grid_n": self.a_grid_n,
             "b_grid_n": self.b_grid_n,
             mep.site.a: (
@@ -329,11 +275,11 @@ class PEST(BaseAgent):
         pd = state.get("pest", {})
         self.method = pd.get("method", self.method)
         self.mep_threshold = pd.get("mep_threshold", self.mep_threshold)
-        self.run_hbmep = pd.get("run_hbmep", self.run_hbmep)
 
         self.a_grid_n = pd.get("a_grid_n", self.a_grid_n)
         self.b_grid_n = pd.get("b_grid_n", self.b_grid_n)
-        self._init_grid()
+        self._init_a_grid()
+        self._init_b_grid()
 
         a = pd.get(mep.site.a, None)
         b = pd.get(mep.site.b, None)

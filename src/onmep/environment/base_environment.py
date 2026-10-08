@@ -54,6 +54,7 @@ class BaseEnvironment(ABC):
         timings_flush_every: int = 1,           # flush buffer every N steps (ndjson)
         timings_overwrite: bool = True,
         timings_tags: dict | None = None,       # attached to each row (e.g., {"agent":"EIG", "draw":7})
+        update_on_action_feature: bool = False,
     ):
         """
         Run until agent.data.n == target.
@@ -84,7 +85,13 @@ class BaseEnvironment(ABC):
                 # Agent update
                 t0 = _now_ns()
                 if obs is not None:
-                    agent_stop = agent.update(obs)
+                    update_kw = {}
+
+                    if update_on_action_feature:
+                        update_kw["feature0"] = obs.features[0]
+
+                    agent_stop = agent.update(obs, **update_kw)
+
                 st = StepTimes(step=agent.data.n, tags=tags.copy())
                 st.t_update_ns = _now_ns() - t0
                 st.agent_stop = agent_stop

@@ -106,7 +106,7 @@ class GenerativeMixin:
 
                     pyro.sample(mep.site.obs, dist_, obs=response)
 
-    def gamma(
+    def rl_gamma(
         self,
         intensity,
         features,
@@ -141,7 +141,7 @@ class GenerativeMixin:
             lik_params=lik_params,
         )
 
-    def lognormal(
+    def rl_lognormal(
         self,
         intensity,
         features,
@@ -271,6 +271,41 @@ class GenerativeMixin:
             num_features=num_features,
             num_response=num_response,
             target_parameter=self.target_parameter,
+        )
+
+        self._observe(
+            intensity=intensity,
+            features=features,
+            response=response,
+            num_used=num_used,
+            num_response=num_response,
+            use_mixture=use_mixture,
+            fn=fn,
+            fn_params=fn_params,
+            lik=lik,
+            lik_params=lik_params,
+        )
+
+    def l5_gamma(
+        self,
+        intensity,
+        features,
+        response=None,
+        num_used=None,
+        num_features=None,
+        num_response=None,
+        use_mixture=None,
+    ):
+        include_c2 = True
+        truncate_g = False
+        fn = partial(mep.functional.logistic5)
+        lik = "gamma"
+
+        fn_params, lik_params = self._sample_priors(
+            num_features=num_features,
+            num_response=num_response,
+            include_c2=include_c2,
+            truncate_g=truncate_g,
         )
 
         self._observe(

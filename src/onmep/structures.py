@@ -358,3 +358,46 @@ class ObsArrays:
         if isinstance(idx, slice):
             return self.at_slice(idx)
         return self.at_index(idx)
+
+    @classmethod
+    def from_df(
+        cls,
+        df,
+        *,
+        intensity: str,
+        features: list[str],
+        response: list[str],
+        id: str = "id",
+    ):
+        required = [intensity, *features, *response]
+        if id in df.columns:
+            required.append(id)
+
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns: {missing}")
+
+        out = cls(
+            D=len(features),
+            R=len(response),
+            initial_capacity=max(len(df), 1),
+        )
+
+        X = df[intensity].to_numpy()
+        F = df[features].to_numpy()
+        Y = df[response].to_numpy()
+
+        if id in df.columns:
+            O = df[id].to_numpy()
+        else:
+            O = np.zeros(len(df), dtype=np.int32)
+
+        for i in range(len(df)):
+            out.append(
+                intensity=X[i],
+                features=F[i],
+                response=Y[i],
+                id=O[i],
+            )
+
+        return out

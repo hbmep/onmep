@@ -1,8 +1,8 @@
 import os
+import uuid
 import logging
 from functools import partial
-from dataclasses import dataclass, replace
-from typing import Any, Callable, TypedDict
+from dataclasses import replace
 
 import hbmep as mep
 import numpy as np
@@ -16,64 +16,10 @@ from numpyro.infer.util import log_likelihood, unconstrain_fn, constrain_fn
 from onmep import Observation, ObsArrays
 from onmep.agent.generative import GenerativeMixin
 from onmep.agent.likelihood import LikelihoodMixin
+from onmep.agent.dtypes import Action, Proposal, MCMCState, Posterior
+from onmep.agent.multiprocessing import _get_executor, _mcmc_one
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class Action:
-    x: float
-    f: list[int]
-    vals: jnp.ndarray | None = None
-
-    def state_dict(self):
-        vals = self.vals
-        d = {
-            "x": self.x,
-            "f": list(self.f),
-            "vals": None if vals is None else np.asarray(vals),
-        }
-        return d
-
-    @classmethod
-    def from_state(cls, state: dict):
-        vals = state.get("vals")
-        if vals is not None:
-            vals = jnp.asarray(vals)
-        obj = cls(x=state["x"], f=state["f"], vals=vals)
-        return obj
-
-
-class MCMCState(TypedDict):
-    state: MCMC | None
-    kernel: NUTS | None
-    model: Callable[..., Any] | None
-
-
-@dataclass
-class Proposal:
-    action: Action
-    phase: str
-    shared: bool = False
-    is_pending: bool = True
-
-    def state_dict(self):
-        d = {
-            "action": self.action.state_dict(),
-            "phase": self.phase,
-            "shared": self.shared,
-            "is_pending": self.is_pending,
-        }
-        return d
-
-    @classmethod
-    def from_state(cls, state):
-        return cls(
-            action=Action.from_state(state["action"]),
-            phase=state["phase"],
-            shared=state.get("shared", False),
-            is_pending=state.get("is_pending", True),
-        )
 
 
 class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
@@ -85,6 +31,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         config: dict | None = None,
         infer: str = "mcmc",
         ess_threshold: float = 0.5,
+        independent_update: bool = True,
         initial_capacity: int = 32,
         K: int = 1,     # possible values of features[0]
         N0: int = 8,    # num observations at 0
@@ -113,6 +60,8 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
         self.infer = infer
         self.ess_threshold = ess_threshold
+        self._independent_update = independent_update
+        self._executor_id = uuid.uuid4().hex
 
         self.data = ObsArrays(
             D=self.num_features,
@@ -129,6 +78,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         self.grid_n = grid_n
         self.grid_x = jnp.linspace(grid_min, grid_max, grid_n, dtype=self.data.dtype_x)
         self.grid_f = jnp.arange(self.K, dtype=self.data.dtype_f)
+        self.grid_r = jnp.arange(self.num_response, dtype=jnp.int32)
         self.grid_max_eff = grid_max_eff
 
         self.update_every = update_every
@@ -143,8 +93,8 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             "kernel": None,
             "model": None,
         }
-        self.posterior: dict | None = None
-        self.logw = None
+        self.posterior: Posterior | None = None
+        self._posterior_u: Posterior | None = None
         return
 
     @property
@@ -245,17 +195,17 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         feature0: int | None = None,
         response: int | None = None
     ) -> Action:
-        vals = self._compute_acquisition(feature0=feature0, response=response)  # (K, N)
+        vals = self._compute_acquisition(feature0=feature0, response=response)  # (K, G)
 
-        mask_x = self.grid_x <= self.grid_max_eff               # (N,)
-        masked = jnp.where(mask_x[None, :], vals, -jnp.inf)     # (K, N)
+        mask_x = self.grid_x <= self.grid_max_eff               # (G,)
+        masked = jnp.where(mask_x[None, :], vals, -jnp.inf)     # (K, G)
 
         flat = jnp.argmax(masked)
-        N = self.grid_x.shape[0]
+        G = self.grid_x.shape[0]
 
-        ix_best = int(flat % N)
+        ix_best = int(flat % G)
         x_best = float(self.grid_x[ix_best])
-        k_best = int(flat // N)
+        k_best = int(flat // G)
 
         return Action(x=x_best, f=[k_best], vals=vals)
 
@@ -326,33 +276,38 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
     def _update_mcmc(
         self,
+        key,
         *,
         data: ObsArrays,
         extra_fields=(),
         init_params=None,
         **kw
-    ) -> tuple[dict, jnp.ndarray]:
+    ) -> Posterior:
         self._require_data(data, "No observations in buffer, collect data before run_mcmc().")
         model_kw = self._model_kwargs(data)
 
         if self._mcmc["kernel"] is None:
             model_fixed = self._get_model_fixed(**kw)
             self._mcmc["kernel"] = NUTS(model_fixed, **self.nuts_kw)
-        mcmc = MCMC(self._mcmc["kernel"], **self.mcmc_kw)
 
-        self.key, sub = random.split(self.key)
-        mcmc.run(sub, **model_kw, extra_fields=extra_fields, init_params=init_params)
+        mcmc = MCMC(self._mcmc["kernel"], **self.mcmc_kw)
+        mcmc.run(key, **model_kw, extra_fields=extra_fields, init_params=init_params)
         self._mcmc["state"] = mcmc
 
-        posterior = mcmc.get_samples()
-        posterior.pop(mep.site.mu, None)
-        posterior.pop(mep.site.obs, None)
+        samples = mcmc.get_samples()
+        named_params = list(self._args)
 
-        S = next(iter(posterior.values())).shape[0]
-        logw = jnp.zeros(S)
-        return posterior, logw
+        if extra_fields:
+            samples.update(mcmc.get_extra_fields())
+            named_params += list(extra_fields)
+
+        return Posterior.from_dict(
+            posterior=samples,
+            named_params=named_params,
+        )
 
     def _update_reweight(self, *, data: ObsArrays, **kw) -> tuple[jnp.ndarray, jnp.ndarray]:
+        raise NotImplementedError
         model_kw = self._model_kwargs(data[-1:])
         model_fixed = self._get_model_fixed(**kw)
 
@@ -368,6 +323,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         return logw, ess
 
     def _needs_rejuvenation(self, ess):
+        raise NotImplementedError
         S = next(iter(self.posterior.values())).shape[0]
         threshold = (
             self.ess_threshold * S
@@ -377,6 +333,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         return ess < threshold
 
     def _update_snis(self, *, data: ObsArrays, **kw) -> tuple[dict, jnp.ndarray]:
+        raise NotImplementedError
         if self.posterior is None:
             return self._update_mcmc(data=data, **kw)
 
@@ -392,6 +349,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         posterior: dict[str, jnp.ndarray],
         logw: jnp.ndarray,
     ) -> dict[str, jnp.ndarray]:
+        raise NotImplementedError
         logw = logw - logsumexp(logw)
         w = jnp.exp(logw)
         S = logw.shape[0]
@@ -411,15 +369,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         shrinkage: float = 0.98,
         **kw,
     ) -> tuple[dict, jnp.ndarray]:
+        raise NotImplementedError
         model_kw = self._model_kwargs(data)
         model_fixed = self._get_model_fixed(**kw)
 
-        z = unconstrain_fn(
-            model_fixed,
-            model_args=(),
-            model_kwargs=model_kw,
-            params=self.posterior,
-        )
+        z = self.posterior_u
 
         self.key, sub = random.split(self.key)
         z = self._resample_posterior(sub, z, logw)
@@ -450,6 +404,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         return out, logw
 
     def _update_smc(self, *, data: ObsArrays, **kw) -> tuple[dict, jnp.ndarray]:
+        raise NotImplementedError
         if self.posterior is None:
             return self._update_mcmc(data=data, **kw)
 
@@ -493,16 +448,15 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             self.data.append_obs(obs_k)
         return
 
-    def _empty_like_posterior(self, posterior: dict[str, jnp.ndarray]):
-        out = {}
-        for name, v in posterior.items():
-            S = v.shape[0]
-            out[name] = jnp.full(
-                (S, self.K, self.num_response),
+    def _empty_like_posterior(self, posterior: Posterior) -> Posterior:
+        return Posterior(
+            array=jnp.full(
+                (posterior.P, posterior.S, self.K, self.num_response),
                 jnp.nan,
-                dtype=v.dtype,
-            )
-        return out
+                dtype=posterior.array.dtype,
+            ),
+            named_params=posterior.named_params,
+        )
 
     def _update_posterior(
         self,
@@ -510,6 +464,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         data: ObsArrays | None = None,
         feature0: int | None = None,
         response: int | None = None,
+        extra_fields=(),
     ):
         if data is None:
             data = self.data
@@ -530,41 +485,97 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             data=data,
             num_features=num_features,
             num_response=num_response,
-            use_mixture=use_mixture
+            use_mixture=use_mixture,
         )
+
+        self.key, sub = random.split(self.key)
 
         match self.infer:
             case "mcmc":
-                posterior_new, logw_new = self._update_mcmc(**update_kw)
+                if not self._independent_update or (
+                    update_kw["num_features"][0] == 1
+                    and update_kw["num_response"] == 1
+                ):
+                    posterior_new = self._update_mcmc(
+                        sub,
+                        **update_kw,
+                        extra_fields=extra_fields,
+                    )
+                else:
+                    data = update_kw.pop("data")
+                    num_features = update_kw.pop("num_features")
+                    num_response = update_kw.pop("num_response")
+                    fs = list(range(num_features[0]))
+                    rs = list(range(num_response))
+
+                    tasks = [(fi, ri) for fi in fs for ri in rs]
+                    keys = random.split(sub, len(tasks))
+                    jobs = [
+                        (
+                            self,
+                            data,
+                            np.asarray(random.key_data(key)),
+                            fi,
+                            ri,
+                            update_kw,
+                            extra_fields,
+                        )
+                        for (fi, ri), key in zip(tasks, keys)
+                    ]
+
+                    executor = _get_executor(self._executor_id, len(tasks))
+                    results = list(executor.map(_mcmc_one, jobs))
+
+                    first = results[0][2]
+                    posterior_new = Posterior(
+                        array=jnp.full(
+                            (
+                                first.P,
+                                first.S,
+                                num_features[0],
+                                num_response,
+                            ),
+                            jnp.nan,
+                            dtype=first.array.dtype,
+                        ),
+                        named_params=first.named_params,
+                    )
+                    for fi, ri, posterior_i in results:
+                        posterior_new.array = posterior_new.array.at[
+                            :, :, fi:fi + 1, ri:ri + 1
+                        ].set(posterior_i.array)
+
+                        posterior_new.logw = posterior_new.logw.at[
+                            :, fi:fi + 1, ri:ri + 1
+                        ].set(posterior_i.logw)
+
             case "snis":
                 if feature0 is not None or response is not None:
                     raise ValueError("snis update does not support sliced updates")
-                posterior_new, logw_new = self._update_snis(**update_kw)
+                posterior_new = self._update_snis(**update_kw)
             case "smc":
                 if feature0 is not None or response is not None:
                     raise ValueError("smc update does not support sliced updates")
-                posterior_new, logw_new = self._update_smc(**update_kw)
+                posterior_new = self._update_smc(**update_kw)
             case _:
                 raise NotImplementedError
 
         if feature0 is None and response is None:
             self.posterior = posterior_new
-            self.logw = logw_new
             return
-
-        fs = slice(feature0, feature0 + 1) if feature0 is not None else slice(None)
-        rs = slice(response, response + 1) if response is not None else slice(None)
 
         if self.posterior is None:
             self.posterior = self._empty_like_posterior(posterior_new)
 
-        for name, v in posterior_new.items():
-            if name in {mep.site.outlier_prob}:
-                self.posterior[name] = v
-            else:
-                self.posterior[name] = self.posterior[name].at[:, fs, rs].set(v)
+        fs = slice(feature0, feature0 + 1) if feature0 is not None else slice(None)
+        rs = slice(response, response + 1) if response is not None else slice(None)
 
-        self.logw = logw_new
+        self.posterior.array = self.posterior.array.at[:, :, fs, rs].set(
+            posterior_new.array
+        )
+        self.posterior.logw = self.posterior.logw.at[:, fs, rs].set(
+            posterior_new.logw
+        )
         return
 
     def should_stop(self):
@@ -578,13 +589,10 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
     ) -> bool:
         if not self._in_postwarm_phase:
             return False
-        n_after_warm = self.data.n - self._num_start
+        n_after_zero = self.data.n - self._num_zero
         should_update = (
             self.update_every > 0
-            and (
-                self.posterior is None
-                or n_after_warm % self.update_every == 0
-            )
+            and n_after_zero % self.update_every == 0
         )
         return should_update
 
@@ -602,12 +610,45 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         should_update = self._should_update(feature0=feature0, response=response)
         if should_update:
             self._update_posterior(feature0=feature0, response=response)
+            self._posterior_u = None
 
         return self.should_stop()
+
+    @property
+    def posterior_dict(self) -> dict[str, jnp.ndarray]:
+        return dict(zip(self._args, self.posterior.array[:len(self._args)]))
+
+    @property
+    def posterior_u(self) -> Posterior:
+        if self.posterior is None:
+            return None
+
+        if self._posterior_u is None:
+            model_kw = self._model_kwargs(self.data)
+            model_fixed = partial(
+                self._model,
+                num_features=[self.K],
+                num_response=self.num_response,
+                use_mixture=self.use_mixture,
+            )
+            z = unconstrain_fn(
+                model_fixed,
+                model_args=(),
+                model_kwargs=model_kw,
+                params=self.posterior_dict,
+            )
+            self._posterior_u = Posterior.from_dict(
+                posterior=z,
+                named_params=self._args,
+                logw=self.posterior.logw
+            )
+
+        return self._posterior_u
 
     def _on_response_changed(self, old, new):
         if getattr(self, "data", None) is not None:
             self.data.resize_R(len(new))
+        self.grid_r = jnp.arange(len(new), dtype=jnp.int32)
         return
 
     def __getstate__(self):
@@ -647,6 +688,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
             "infer": self.infer,
             "ess_threshold": self.ess_threshold,
+            "_independent_update": self._independent_update,
 
             "data": self.data.state_dict(),
             "K": self.K,
@@ -669,16 +711,11 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         }
 
         if include_posterior:
-            posterior = None
-            if self.posterior is not None:
-                remove_keys = (mep.site.mu, mep.site.obs)
-                posterior = {
-                    k: np.asarray(v)
-                    for k, v in self.posterior.items()
-                    if k not in remove_keys
-                }
-            out["posterior"] = posterior
-            out["logw"] = None if self.logw is None else np.asarray(self.logw)
+            out["posterior_state"] = (
+                None
+                if self.posterior is None
+                else self.posterior.state_dict()
+            )
 
         return out
 
@@ -693,6 +730,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
 
         self.infer = state.get("infer", self.infer)
         self.ess_threshold = state.get("ess_threshold", self.ess_threshold)
+        self._independent_update = state.get("_independent_update", self._independent_update)
 
         self.data = ObsArrays.from_state(state["data"])
         self.K = state.get("K", self.K)
@@ -706,6 +744,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
         self.grid_n = state.get("grid_n", self.grid_n)
         self.grid_x = jnp.linspace(grid_min, grid_max, self.grid_n, dtype=self.data.dtype_x)
         self.grid_f = jnp.arange(self.K, dtype=self.data.dtype_f)
+        self.grid_r = jnp.arange(self.num_response, dtype=jnp.int32)
         self.grid_max_eff = state.get("grid_max_eff", self.grid_max_eff)
 
         self.update_every = state.get("update_every", self.update_every)
@@ -726,12 +765,28 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             last_proposal = Proposal.from_state(last_proposal)
         self._last_proposal = last_proposal
 
-        posterior = state.get("posterior", self.posterior)
-        if posterior is not None:
-            self.posterior = {u: jnp.asarray(v) for u, v in posterior.items()}
-
-        logw = state.get("logw", None)
-        self.logw = jnp.asarray(logw) if logw is not None else None
+        posterior_state = state.get("posterior_state", self.posterior)
+        if posterior_state is None:
+            posterior = state.get("posterior", self.posterior)
+            if posterior is not None:   # TODO: legacy code, remove later
+                logw = state.get("logw", None)
+                if logw is not None:
+                    if logw.ndim != 1:
+                        raise ValueError
+                    if self.num_response != 1:
+                        raise ValueError
+                    if self.K != 1 and logw.sum() != 0:
+                        raise ValueError
+                    logw = logw[:, None, None]
+                    logw = np.broadcast_to(logw, (logw.shape[0], self.K, self.num_response))
+                posterior = Posterior.from_dict(
+                    posterior=posterior,
+                    named_params=self._args,
+                    logw=logw
+                )
+        else:
+            posterior = Posterior.from_state(posterior_state)
+        self.posterior = posterior
 
         self._reset_mcmc()
         return self
@@ -745,9 +800,7 @@ class BaseAgent(GenerativeMixin, LikelihoodMixin, mep.BaseModel):
             raise ValueError("No posterior available. Run update first.")
 
         df = self.data.to_df(**self.variables)
-        posterior = {u: np.array(v) for u, v in self.posterior.items()}
-        posterior.pop(mep.site.mu, None)
-        posterior.pop(mep.site.obs, None)
+        posterior = self.posterior_dict
         prediction_df = self.make_prediction_dataset(df, num_points=num_points)
         ppd = self.predict(
             df=prediction_df,
